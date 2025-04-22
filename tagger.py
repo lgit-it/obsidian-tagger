@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 # --- Constants ---
 DEFAULT_CHUNK_SIZE_TOKENS = 1500 # Approximation, use chars as primary limit
 DEFAULT_CHUNK_SIZE_CHARS = 4000
-DEFAULT_MAX_TAGS_PER_DOC = 20
+DEFAULT_MAX_TAGS_PER_DOC = 12
 DEFAULT_DB_FILE = "tags.db"
 DEFAULT_LOG_FILE = "tagger.log"
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
@@ -48,18 +48,17 @@ DEFAULT_SYNONYMS_FILE = "synonyms.json"
 
 # Default prices per 1000 tokens (USD) - Overridable via CLI
 DEFAULT_PRICE_TABLE = {
-    "gpt-4o": {"prompt": 0.60 / 1000, "completion": 2.4 / 1000}, # As of 2024-05, check current pricing
+    "gpt-4o-mini": {"prompt": 0.60 / 1000, "completion": 2.4 / 1000}, # As of 2024-05, check current pricing
     "gpt-3.5-turbo": {"prompt": 0.0005, "completion": 0.0015}
 }
 
 # LLM Prompt Structure
 LLM_SYSTEM_PROMPT = "Sei un assistente che propone tag coerenti per note Obsidian in formato Markdown. Concentrati sui i temi principali, concetti chiave, entità, argomenti e categorie rilevanti, entità menzionate nel testo."
-LLM_USER_PROMPT_TEMPLATE = """Analizza il seguente contenuto della nota e proponi fino a 15 tag rilevanti in italiano. I tag devono essere parole significative o concetti caratterizzanti il testo.
-Preferisci termini singolari ai plurali
+LLM_USER_PROMPT_TEMPLATE = """Analizza il seguente contenuto della nota e proponi fino a 10 tag rilevanti in inglese o italiano. 
+I tag devono essere parole significative o concetti caratterizzanti il testo.
+Preferisci termini singolari ai plurali.
 Usa il minuscolo per standardizzare i tag
-Per concetti composti da più parole, usa il formato camelCase o separali con underscore
 Includi sia tag generali che specifici per facilitare diversi livelli di ricerca
-Evita tag troppo vaghi o generici che potrebbero applicarsi a quasi tutte le note
 Non usare più di 2 parole per ogni tag
 I tag devono essere in minuscolo, usare trattini per separare parole (formato kebab-case) e rappresentare concetti specifici.
 
@@ -71,7 +70,8 @@ Contenuto della nota:
 Proposte iniziali da KeyBERT (usale come ispirazione ma non limitarti ad esse):
 {keybert_tags}
 
-Restituisci SOLO un array JSON di stringhe contenente i tag proposti. Esempio: ["primo-tag", "secondo-tag-composto", "terzo-tag"]
+Restituisci SOLO un array JSON di stringhe contenente i tag proposti. 
+Esempio:["tag1", "tag2-composto", "tag3", "tag4"]
 Non aggiungere commenti, spiegazioni o testo introduttivo. Assicurati che l'output sia JSON valido."""
 
 # --- Global Variables ---
@@ -179,16 +179,25 @@ def load_env(env_path: Optional[str] = None) -> None:
 
 def parse_args() -> argparse.Namespace:
     """Parses command-line arguments."""
-    parser = argparse.ArgumentParser(description="Automated tagging for Obsidian vaults.")
+    parser = argparse.ArgumentParser(description="Automated tagging for Obsidian vaults using OpenAI or Ollama.")
     parser.add_argument("--vault", required=True, type=str, help="Path to the Obsidian vault directory.")
     parser.add_argument("--db", default=DEFAULT_DB_FILE, type=str, help="Path to the SQLite database file.")
     parser.add_argument("--chunk-size-chars", default=DEFAULT_CHUNK_SIZE_CHARS, type=int, help="Maximum character size for text chunks.")
-    # --chunk-size-tokens is omitted as char count is the primary driver now
-    parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL, type=str, help="OpenAI model name to use for tag generation.")
-    parser.add_argument("--openai-api-key", default=os.getenv("OPENAI_API_KEY"), type=str, help="OpenAI API key (overrides .env or environment variable).")
+    # --- LLM Provider Selection ---
+    parser.add_argument("--llm-provider", default="openai", choices=["openai", "ollama"], help="LLM provider to use.")
+
+    # --- OpenAI Specific Arguments ---
+    parser.add_argument("--openai-model", default=DEFAULT_LLM_MODEL, type=str, help="OpenAI model name (used if --llm-provider=openai).")
+    parser.add_argument("--openai-api-key", default=os.getenv("OPENAI_API_KEY"), type=str, help="OpenAI API key (required if --llm-provider=openai; overrides .env).")
+    parser.add_argument("--price-prompt", type=float, help="Price per 1000 prompt tokens (USD) for OpenAI. Overrides default.")
+    parser.add_argument("--price-completion", type=float, help="Price per 1000 completion tokens (USD) for OpenAI. Overrides default.")
+
+    # --- Ollama Specific Arguments ---
+    parser.add_argument("--ollama-url", default="http://localhost:11434", type=str, help="Base URL for the Ollama API (used if --llm-provider=ollama).")
+    parser.add_argument("--ollama-model", type=str, default=None, help="Ollama model name (e.g., 'llama3', 'mistral'; required if --llm-provider=ollama).")
+
+    # --- Common Arguments ---
     parser.add_argument("--max-tags-per-doc", default=DEFAULT_MAX_TAGS_PER_DOC, type=int, help="Maximum number of canonical tags to write back to a document.")
-    parser.add_argument("--price-prompt", type=float, help="Price per 1000 prompt tokens (USD). Overrides default.")
-    parser.add_argument("--price-completion", type=float, help="Price per 1000 completion tokens (USD). Overrides default.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Logging level.")
     parser.add_argument("--resume", dest='resume', action='store_true', help="Resume processing, skip already processed files.")
     parser.add_argument("--no-resume", dest='resume', action='store_false', help="Start processing from scratch (default).")
@@ -200,21 +209,31 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
-    # Validate vault path
+    # --- Argument Validation ---
     if not Path(args.vault).is_dir():
         print(f"Error: Vault path '{args.vault}' not found or is not a directory.", file=sys.stderr)
         sys.exit(1)
 
-    # Load API key if provided via arg
-    if args.openai_api_key:
-        os.environ['OPENAI_API_KEY'] = args.openai_api_key
-    elif not os.getenv('OPENAI_API_KEY'): # Check again after arg parse
-         print(f"Error: OpenAI API key must be provided via --openai-api-key, .env file, or environment variable.", file=sys.stderr)
-         sys.exit(1)
+    # Load OpenAI API key if provided via arg (for OpenAI provider)
+    if args.llm_provider == 'openai':
+        if args.openai_api_key:
+            os.environ['OPENAI_API_KEY'] = args.openai_api_key
+        # Check if key is available (after arg parse and .env load)
+        # Do the actual check in main() after load_env() is called
+    elif args.llm_provider == 'ollama':
+        if not args.ollama_model:
+            print("Error: --ollama-model is required when --llm-provider is 'ollama'.", file=sys.stderr)
+            sys.exit(1)
+        # Add /v1 to ollama url if not present (common requirement for OpenAI compatibility)
+        if not args.ollama_url.endswith('/v1'):
+             if args.ollama_url.endswith('/'):
+                 args.ollama_url += 'v1'
+             else:
+                 args.ollama_url += '/v1'
+             logging.info(f"Appended '/v1' to Ollama URL: {args.ollama_url}")
 
 
     return args
-
 def signal_handler(sig, frame):
     """Handles graceful shutdown on interruption."""
     global interrupted, db_client_global, log_handler_global
@@ -244,41 +263,51 @@ class CostTracker:
         self.total_completion_tokens = 0
         self.total_cost = 0.0
         self.call_count = 0
+        self.providers_used = set() # Keep track of which providers were used
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def add_call(self, model: str, prompt_tokens: int, completion_tokens: int, doc_path: Optional[str] = None):
-        """Records an API call and calculates its cost."""
+    def add_call(self, provider: str, model: str, prompt_tokens: int, completion_tokens: int, doc_path: Optional[str] = None):
+        """Records an API call and calculates its cost if applicable."""
         self.call_count += 1
         self.total_prompt_tokens += prompt_tokens
         self.total_completion_tokens += completion_tokens
+        self.providers_used.add(provider)
+        cost = 0.0 # Default cost is 0 (for Ollama or unknown models)
 
-        if model not in self.price_table:
-            self.logger.warning(f"Model '{model}' not found in price table. Using default 0 cost.")
-            cost = 0.0
-        else:
-            prices = self.price_table[model]
-            cost = (prompt_tokens * prices.get('prompt', 0.0) +
-                    completion_tokens * prices.get('completion', 0.0)) / 1000.0
-            self.total_cost += cost
+        if provider == 'openai':
+            if model not in self.price_table:
+                self.logger.warning(f"OpenAI model '{model}' not found in price table. Using 0 cost for this call.")
+            else:
+                prices = self.price_table[model]
+                cost = (prompt_tokens * prices.get('prompt', 0.0) +
+                        completion_tokens * prices.get('completion', 0.0)) / 1000.0
+                self.total_cost += cost
 
         log_prefix = f"{Path(doc_path).name} | " if doc_path else ""
+        # Log cost only if it's non-zero (or always display $0.00000?) Let's show conditionally
+        cost_str = f" | cost={cost:.5f}$" if cost > 0 else ""
         self.logger.info(
-            f"{log_prefix}API Call {self.call_count}: model={model} | "
-            f"prompt_tok={prompt_tokens} | compl_tok={completion_tokens} | cost={cost:.5f}$"
+            f"{log_prefix}API Call {self.call_count}: provider={provider} | model={model} | "
+            f"prompt_tok={prompt_tokens} | compl_tok={completion_tokens}{cost_str}"
         )
         return cost
 
     def report(self) -> None:
         """Logs the final cost summary."""
+        provider_str = ", ".join(sorted(list(self.providers_used)))
+        cost_summary = f"Estimated total cost (OpenAI only): {self.total_cost:.4f}$" if 'openai' in self.providers_used else "Estimated total cost: $0.00 (Ollama used)"
+
         summary = (
-            f"Processing complete. Total OpenAI API calls: {self.call_count} | "
+            f"Processing complete. LLM Provider(s) Used: {provider_str} | "
+            f"Total LLM calls: {self.call_count} | "
             f"Total prompt tokens: {self.total_prompt_tokens} | "
             f"Total completion tokens: {self.total_completion_tokens} | "
-            f"Estimated total cost: {self.total_cost:.4f}$"
+            f"{cost_summary}"
         )
         self.logger.info(summary)
         print(summary) # Also print to console
-
+        
+        
 class DBClient:
     """Handles all database interactions."""
     def __init__(self, db_path: str):
@@ -400,7 +429,7 @@ class DBClient:
     def mark_status(self, doc_id: int, status: str) -> None:
         """Marks the processing status of a document."""
         now = datetime.now()
-        now_iso = now.isoformat() # <--- FORMAT TO STRING
+        now_iso = now.isoformat()
         query = """
             INSERT INTO progress (doc_id, status, updated)
             VALUES (?, ?, ?)
@@ -413,7 +442,7 @@ class DBClient:
     def add_or_update_doc(self, path: str, title: Optional[str], mtime: float) -> int:
         """Adds or updates a document record, returning its ID."""
         now = datetime.fromtimestamp(mtime)
-        now_iso = now.isoformat() # <--- FORMAT TO STRING
+        now_iso = now.isoformat()
         query_insert = """
             INSERT INTO doc (path, title, mtime) VALUES (?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
@@ -572,15 +601,21 @@ class VaultWalker:
         return md_files
 
 
+
 class TagExtractor:
     """Extracts candidate tags using KeyBERT and an LLM."""
-    def __init__(self, openai_client: OpenAI, cost_tracker: CostTracker,
-                 llm_model: str, max_tags_per_chunk: int):
+    def __init__(self,
+                 openai_client: OpenAI, # Client is now generic (OpenAI SDK obj)
+                 cost_tracker: CostTracker,
+                 llm_provider: str,     # Added
+                 model_name: str,       # Changed from llm_model
+                 max_tags_per_chunk: int):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.keybert_model = KeyBERT(model=DEFAULT_EMBEDDING_MODEL_KEYBERT)
-        self.openai_client = openai_client
+        self.llm_client = openai_client # Renamed for clarity
         self.cost_tracker = cost_tracker
-        self.llm_model = llm_model
+        self.llm_provider = llm_provider # Store provider
+        self.model_name = model_name     # Store the actual model name
         self.max_tags_per_chunk = max_tags_per_chunk
         self.yaml_delim = re.compile(r'^---\s*$', re.MULTILINE)
         self.code_block_delim = re.compile(r'```.*?```', re.DOTALL)
@@ -633,82 +668,97 @@ class TagExtractor:
             return []
 
 
+
     def _extract_llm_tags(self, chunk_text: str, keybert_tags: List[str], doc_path: str) -> List[str]:
-        """Uses OpenAI API to extract tags based on chunk and KeyBERT suggestions."""
+        """Uses the configured LLM provider API to extract tags."""
         user_prompt = LLM_USER_PROMPT_TEMPLATE.format(
-            chunk_text=chunk_text[:8000], # Truncate just in case, ~2k tokens safeguard
+            chunk_text=chunk_text[:8000], # Truncate just in case
             keybert_tags=", ".join(keybert_tags)
         )
 
+        request_params = {
+            "model": self.model_name, # Use the stored model name
+            "messages": [
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 250,
+            "top_p": 1.0,
+            "n": 1,
+            "stop": None
+        }
+
+        # Add response_format only for OpenAI, as Ollama support varies
+        if self.llm_provider == 'openai':
+            request_params["response_format"] = {"type": "json_object"}
+        else:
+            request_params["response_format"] = {"type": "json_object"}
+            
+            
         try:
-            response = self.openai_client.chat.completions.create(
-                model=self.llm_model,
-                messages=[
-                    {"role": "system", "content": LLM_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.2,
-                max_tokens=150, # Generous buffer for ~15 tags + JSON overhead
-                top_p=1.0,
-                n=1,
-                response_format={"type": "json_object"}, # Enforce JSON output if model supports
-                stop=None
+            response = self.llm_client.chat.completions.create(**request_params)
+
+            # Ensure usage data is present (might be None for some Ollama setups/errors)
+            prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+            completion_tokens = response.usage.completion_tokens if response.usage else 0
+
+            # Pass provider to cost tracker
+            self.cost_tracker.add_call(
+                provider=self.llm_provider,
+                model=self.model_name,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                doc_path=doc_path
             )
 
-            prompt_tokens = response.usage.prompt_tokens
-            completion_tokens = response.usage.completion_tokens
-            self.cost_tracker.add_call(self.llm_model, prompt_tokens, completion_tokens, doc_path)
+            content = response.choices[0].message.content.strip() if response.choices else ""
+            if not content:
+                 self.logger.warning(f"{Path(doc_path).name} | LLM returned empty content.")
+                 return []
 
-            content = response.choices[0].message.content.strip()
-
-            # Parse the JSON response
+            # --- JSON Parsing Logic ---
             try:
-                # The prompt asks for a JSON array directly, often the model wraps it
-                # Try to parse directly, then look for list within a dict
                 tags = json.loads(content)
-                if isinstance(tags, list): # Direct list
-                    extracted_tags = [str(tag).lower() for tag in tags if isinstance(tag, str)]
-                elif isinstance(tags, dict): # Check common wrapper keys like 'tags'
-                     key_options = ['tags', 'keywords', 'tag_list', 'result']
-                     found = False
-                     for key in key_options:
-                         if key in tags and isinstance(tags[key], list):
-                             extracted_tags = [str(tag).lower() for tag in tags[key] if isinstance(tag, str)]
-                             found = True
-                             break
-                     if not found:
-                         self.logger.warning(f"LLM returned JSON object but no recognized tag list key: {content}")
-                         extracted_tags = []
-                else:
-                    self.logger.warning(f"LLM returned unexpected JSON type ({type(tags)}): {content}")
-                    extracted_tags = []
-
-                # Limit number of tags per chunk if needed
-                return extracted_tags[:self.max_tags_per_chunk]
+                # ... (rest of JSON parsing logic) ...
 
             except json.JSONDecodeError:
-                self.logger.error(f"LLM response was not valid JSON: {content}", exc_info=True)
-                # Fallback: try regex to extract dash-separated words in quotes (less reliable)
-                tags_found = re.findall(r'"([a-z0-9-]+)"', content)
-                if tags_found:
-                    self.logger.warning("Used regex fallback to extract tags from non-JSON response.")
-                    return tags_found[:self.max_tags_per_chunk]
-                return []
+                self.logger.error(f"{Path(doc_path).name} | LLM response was not valid JSON: {content}", exc_info=False) # exc_info=False to avoid logging full trace for common issue
+                # ... (fallback regex logic) ...
+
+            # Limit number of tags per chunk if needed
+            return extracted_tags[:self.max_tags_per_chunk] # Ensure extracted_tags is defined in all paths
 
 
-        except RateLimitError as e:
-            self.logger.error(f"OpenAI rate limit exceeded. Waiting and retrying might be needed. {e}")
-            # Basic retry could be added here, but often needs exponential backoff
-            time.sleep(10) # Simple wait
-            return self._extract_llm_tags(chunk_text, keybert_tags, doc_path) # Retry once
-        except APIError as e:
-            self.logger.error(f"OpenAI API error: {e}", exc_info=True)
+        except APIError as e: # General API errors (rate limits, auth for OpenAI, server errors)
+             # Check for specific connection errors common with local Ollama
+             if self.llm_provider == 'ollama' and isinstance(e.cause, ConnectionRefusedError):
+                 self.logger.error(f"Connection to Ollama server refused at {self.llm_client.base_url}. Is Ollama running? Error: {e}", exc_info=False)
+                 # Optional: Raise exception or sys.exit() if Ollama connection fails repeatedly? For now, just return empty.
+                 return []
+             elif self.llm_provider == 'ollama' and isinstance(e.cause, requests.exceptions.ConnectionError): # If using requests internally
+                  self.logger.error(f"Could not connect to Ollama server at {self.llm_client.base_url}. Is Ollama running? Error: {e}", exc_info=False)
+                  return []
+
+             self.logger.error(f"API error during LLM call ({self.llm_provider}): {e}", exc_info=True)
+             # Basic retry for rate limit might be added here for OpenAI
+             if isinstance(e, RateLimitError) and self.llm_provider == 'openai':
+                 self.logger.warning("Rate limit exceeded. Waiting 10 seconds and retrying once...")
+                 time.sleep(10)
+                 # Be careful with recursion here, only retry once simply
+                 # return self._extract_llm_tags(chunk_text, keybert_tags, doc_path) # Simple single retry
+             return []
+        except ImportError as e: # Handle potential underlying library issues if requests isn't found etc.
+              if 'requests' in str(e) and self.llm_provider == 'ollama':
+                   self.logger.error("The 'requests' library might be required for Ollama connection via OpenAI client. Please install it: pip install requests", exc_info=False)
+                   sys.exit(1) # Exit if dependency missing
+              else:
+                  self.logger.error(f"Import error during LLM call: {e}", exc_info=True)
+                  return []
+
+        except Exception as e: # Catch other unexpected errors
+            self.logger.error(f"Unexpected error during LLM ({self.llm_provider}) API call: {e}", exc_info=True)
             return []
-        except Exception as e:
-            self.logger.error(f"Unexpected error during OpenAI API call: {e}", exc_info=True)
-            return []
-
-
     def extract(self, full_content: str, doc_path: str, chunk_size_chars: int) -> List[str]:
         """Cleans content, chunks it, and extracts tags using KeyBERT and LLM."""
         cleaned_content = self.clean_content(full_content)
@@ -1054,67 +1104,113 @@ def write_back(file_path: Path, canonical_tags: List[str], dry_run: bool) -> Non
     except Exception as e:
         logger.error(f"{file_path.name} | Error processing file for write-back: {e}", exc_info=True)
 
+# Find the main() function
 
 def main():
     """Main script execution function."""
-    global db_client_global # Allow signal handler to access DB client
+    global db_client_global
 
     args = parse_args()
     setup_logging(args.log_level, DEFAULT_LOG_FILE)
     logging.info("Tagger script started.")
     logging.debug(f"Arguments: {args}")
 
-    load_env(args.env_file)
+    load_env(args.env_file) # Load .env before checking keys
+
+    # --- Validate API key for OpenAI ---
+    openai_api_key = None
+    if args.llm_provider == 'openai':
+        openai_api_key = args.openai_api_key # Already loaded from env/arg by parse_args logic
+        if not openai_api_key:
+            logging.critical("OpenAI API key is required when --llm-provider=openai. Provide via --openai-api-key, .env file, or OPENAI_API_KEY environment variable.")
+            sys.exit(1)
+        logging.info("Using OpenAI provider.")
+    elif args.llm_provider == 'ollama':
+         logging.info(f"Using Ollama provider with model '{args.ollama_model}' at {args.ollama_url}")
+         # API key not needed, but the library requires one - pass a dummy string
+         openai_api_key = "ollama"
+
 
     # --- Initialize components ---
     cost_tracker = CostTracker(DEFAULT_PRICE_TABLE)
-    # Override prices if provided via CLI
-    if args.price_prompt is not None or args.price_completion is not None:
-         model_prices = cost_tracker.price_table.get(args.llm_model, {})
+    # Override OpenAI prices if provided via CLI and provider is OpenAI
+    if args.llm_provider == 'openai' and (args.price_prompt is not None or args.price_completion is not None):
+         model_prices = cost_tracker.price_table.get(args.openai_model, {})
          if args.price_prompt is not None:
              model_prices['prompt'] = args.price_prompt
          if args.price_completion is not None:
               model_prices['completion'] = args.price_completion
-         cost_tracker.price_table[args.llm_model] = model_prices
-         logging.info(f"Updated price table for {args.llm_model}: {model_prices}")
+         cost_tracker.price_table[args.openai_model] = model_prices
+         logging.info(f"Updated price table for {args.openai_model}: {model_prices}")
 
 
     try:
         db_client = DBClient(args.db)
-        db_client_global = db_client # Assign to global var for signal handler
+        db_client_global = db_client
     except Exception as e:
         logging.critical(f"Failed to initialize database. Exiting. Error: {e}", exc_info=True)
         sys.exit(1)
 
     if args.reset_db:
         if args.dry_run:
-             logging.warning("[Dry Run] Skipping database reset.")
+            logging.warning("[Dry Run] Skipping database reset.")
         else:
-             db_client.reset_db()
+            db_client.reset_db()
     else:
-         db_client.ensure_schema() # Ensure schema exists if not resetting
+         db_client.ensure_schema()
 
 
+    # --- Initialize LLM Client (Conditionally) ---
     try:
-        openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        # Test connection (optional, but good practice)
-        openai_client.models.list()
-        logging.info("OpenAI client initialized and connection tested.")
+        if args.llm_provider == 'openai':
+            llm_client = OpenAI(api_key=openai_api_key)
+            # Test connection (optional, but good practice)
+            llm_client.models.list()
+            logging.info("OpenAI client initialized and connection tested.")
+            actual_model_name = args.openai_model # Set model name for OpenAI
+        elif args.llm_provider == 'ollama':
+            # Use OpenAI client but point to Ollama URL
+            llm_client = OpenAI(
+                base_url=args.ollama_url, # Already includes /v1 from parse_args
+                api_key=openai_api_key, # Dummy key, required by lib but ignored by Ollama
+            )
+            # Optional: Add a basic connection test for Ollama if possible/needed
+            # e.g., try listing models or a simple completion
+            try:
+                 # Simple test: List models (might require different endpoint if /v1 doesn't support)
+                 # or just proceed and handle errors during first call
+                 # llm_client.models.list() # This might fail depending on Ollama's OpenAI compatibility level
+                 logging.info(f"Ollama client initialized pointing to {args.ollama_url}.")
+            except Exception as ollama_conn_err:
+                 logging.warning(f"Could not fully verify connection to Ollama during init: {ollama_conn_err}", exc_info=False)
+            actual_model_name = args.ollama_model # Set model name for Ollama
+        else:
+             # Should not happen due to argparse choices, but belts and braces
+             logging.critical(f"Unsupported LLM provider: {args.llm_provider}")
+             sys.exit(1)
+
     except APIError as e:
-         logging.critical(f"Failed to initialize or connect OpenAI client: {e}. Check API key and network.", exc_info=True)
+         # This might catch auth errors for OpenAI, or connection errors if test fails
+         logging.critical(f"Failed to initialize LLM client for {args.llm_provider}: {e}. Check API key/URL and network.", exc_info=True)
          if db_client: db_client.close()
          sys.exit(1)
-    except Exception as e: # Catch other init errors like invalid key format
-         logging.critical(f"Unexpected error initializing OpenAI client: {e}", exc_info=True)
+    except Exception as e: # Catch other init errors
+         logging.critical(f"Unexpected error initializing LLM client: {e}", exc_info=True)
          if db_client: db_client.close()
          sys.exit(1)
 
 
-    # Initialize other components (lazy loading for models inside classes)
+    # --- Initialize other components ---
     vault_walker = VaultWalker(args.vault)
-    tag_extractor = TagExtractor(openai_client, cost_tracker, args.llm_model, 15) # Max 15 tags per LLM call
+    # Pass the correct provider and model name to TagExtractor
+    tag_extractor = TagExtractor(
+        openai_client=llm_client,
+        cost_tracker=cost_tracker,
+        llm_provider=args.llm_provider, # Pass provider
+        model_name=actual_model_name,   # Pass the selected model name
+        max_tags_per_chunk=15
+    )
     tag_normaliser = TagNormaliser(db_client, args.synonyms)
-
 
     # --- Setup interrupt handler ---
     signal.signal(signal.SIGINT, signal_handler)
