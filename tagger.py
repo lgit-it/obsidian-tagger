@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 import time
 from typing import List, Dict, Tuple, Optional, Set, Any
+import logging.handlers
 
 # Third-party libraries
 import spacy
@@ -39,7 +40,7 @@ DEFAULT_CHUNK_SIZE_CHARS = 4000
 DEFAULT_MAX_TAGS_PER_DOC = 20
 DEFAULT_DB_FILE = "tags.db"
 DEFAULT_LOG_FILE = "tagger.log"
-DEFAULT_LLM_MODEL = "gpt-4o"
+DEFAULT_LLM_MODEL = "gpt-4o-mini"
 DEFAULT_EMBEDDING_MODEL_SBERT = 'sentence-transformers/all-MiniLM-L6-v2'
 DEFAULT_EMBEDDING_MODEL_KEYBERT = 'sentence-transformers/all-MiniLM-L6-v2' # Can be same or different
 DEFAULT_SPACY_MODEL = 'it_core_news_lg'
@@ -47,13 +48,20 @@ DEFAULT_SYNONYMS_FILE = "synonyms.json"
 
 # Default prices per 1000 tokens (USD) - Overridable via CLI
 DEFAULT_PRICE_TABLE = {
-    "gpt-4o": {"prompt": 0.005, "completion": 0.015}, # As of 2024-05, check current pricing
+    "gpt-4o": {"prompt": 0.60 / 1000, "completion": 2.4 / 1000}, # As of 2024-05, check current pricing
     "gpt-3.5-turbo": {"prompt": 0.0005, "completion": 0.0015}
 }
 
 # LLM Prompt Structure
-LLM_SYSTEM_PROMPT = "Sei un assistente che propone tag coerenti per note Obsidian in formato Markdown. Concentrati sui concetti chiave, temi ed entità menzionate nel testo."
-LLM_USER_PROMPT_TEMPLATE = """Analizza il seguente contenuto della nota e proponi fino a 15 tag rilevanti in italiano. I tag devono essere in minuscolo, usare trattini per separare parole (formato kebab-case) e rappresentare concetti specifici.
+LLM_SYSTEM_PROMPT = "Sei un assistente che propone tag coerenti per note Obsidian in formato Markdown. Concentrati sui i temi principali, concetti chiave, entità, argomenti e categorie rilevanti, entità menzionate nel testo."
+LLM_USER_PROMPT_TEMPLATE = """Analizza il seguente contenuto della nota e proponi fino a 15 tag rilevanti in italiano. I tag devono essere parole significative o concetti caratterizzanti il testo.
+Preferisci termini singolari ai plurali
+Usa il minuscolo per standardizzare i tag
+Per concetti composti da più parole, usa il formato camelCase o separali con underscore
+Includi sia tag generali che specifici per facilitare diversi livelli di ricerca
+Evita tag troppo vaghi o generici che potrebbero applicarsi a quasi tutte le note
+Non usare più di 2 parole per ogni tag
+I tag devono essere in minuscolo, usare trattini per separare parole (formato kebab-case) e rappresentare concetti specifici.
 
 Contenuto della nota:
 ---
@@ -386,12 +394,13 @@ class DBClient:
             JOIN progress p ON d.id = p.doc_id
             WHERE d.path = ? AND d.mtime = ?
         """
-        row = self._fetchone(query, (path, datetime.fromtimestamp(mtime)))
+        row = self._fetchone(query, (path, datetime.fromtimestamp(mtime).isoformat()))
         return row['status'] if row else None
 
     def mark_status(self, doc_id: int, status: str) -> None:
         """Marks the processing status of a document."""
         now = datetime.now()
+        now_iso = now.isoformat() # <--- FORMAT TO STRING
         query = """
             INSERT INTO progress (doc_id, status, updated)
             VALUES (?, ?, ?)
@@ -399,11 +408,12 @@ class DBClient:
                 status = excluded.status,
                 updated = excluded.updated
         """
-        self._execute(query, (doc_id, status, now))
+        self._execute(query, (doc_id, status, now_iso))
 
     def add_or_update_doc(self, path: str, title: Optional[str], mtime: float) -> int:
         """Adds or updates a document record, returning its ID."""
         now = datetime.fromtimestamp(mtime)
+        now_iso = now.isoformat() # <--- FORMAT TO STRING
         query_insert = """
             INSERT INTO doc (path, title, mtime) VALUES (?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
@@ -415,7 +425,7 @@ class DBClient:
         query_select = "SELECT id FROM doc WHERE path = ?"
 
         try:
-            self.cursor.execute(query_insert, (path, title, now))
+            self.cursor.execute(query_insert, (path, title, now_iso))
             row = self.cursor.fetchone()
             if row:
                  doc_id = row['id']
@@ -722,11 +732,11 @@ class TagExtractor:
             self.logger.debug(f"{Path(doc_path).name} | Chunk {i+1} | LLM proposals: {llm_tags}")
 
             for tag in llm_tags:
-                 # Basic validation: kebab-case, lowercase
-                 if re.match(r'^[a-z0-9]+(-[a-z0-9]+)*$', tag):
-                     all_raw_tags.add(tag)
-                 else:
-                      self.logger.warning(f"{Path(doc_path).name} | Skipping invalid tag format from LLM: '{tag}'")
+                # Basic validation: kebab-case, lowercase, ALLOWING ITALIAN ACCENTS
+                if re.match(r'^[a-z0-9àèéìòù]+(-[a-z0-9àèéìòù]+)*$', tag): # <--- CORRECTED REGEX
+                    all_raw_tags.add(tag)
+                else:
+                    self.logger.warning(f"{Path(doc_path).name} | Skipping invalid tag format from LLM: '{tag}'")
 
 
         self.logger.info(f"{Path(doc_path).name} | Extracted {len(all_raw_tags)} unique raw tags from LLM across all chunks.")
@@ -1023,7 +1033,7 @@ def write_back(file_path: Path, canonical_tags: List[str], dry_run: bool) -> Non
                 yaml.preserve_quotes = True
 
                 # Dump the modified content back to the file
-                updated_content = frontmatter.dumps(post, handler=frontmatter.YAMLHandler(yaml_engine=yaml))
+                updated_content = frontmatter.dumps(post, handler=frontmatter.YAMLHandler())
 
                 with file_path.open('w', encoding='utf-8') as f:
                     f.write(updated_content)
